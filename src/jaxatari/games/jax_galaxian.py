@@ -7,9 +7,6 @@ import chex
 import pygame
 from gymnax.environments import spaces
 
-from src.jaxatari.games.jax_kangaroo import SCREEN_HEIGHT, SCREEN_WIDTH
-
-#from jaxatari.games.jax_kangaroo import SCREEN_WIDTH
 
 
 # -------- Game constants --------
@@ -19,11 +16,12 @@ BULLET_MOVE_SPEED = 2
 SCREEN_HEIGHT = 600
 SCREEN_WIDTH = 800
 GRID_ROWS = 5
-GRID_COLS = 7
-ENEMY_SPACING_X = 20
-ENEMY_SPACING_Y = 20
+GRID_COLS = 5
+ENEMY_SPACING_X = 50
+ENEMY_SPACING_Y = 50
 ENEMY_GRID_Y = 300
 START_X = 100
+COLLISION_THRESHOLD = 10
 
 class GalaxianState(NamedTuple):
     player_x: chex.Array
@@ -32,7 +30,8 @@ class GalaxianState(NamedTuple):
     player_shooting_cooldown: chex.Array
     bullet_x: chex.Array
     bullet_y: chex.Array
-    enemy_grid: chex.Array
+    enemy_grid_x: chex.Array
+    enemy_grid_y: chex.Array
     enemy_grid_alive: chex.Array
     enemy_grid_direction: chex.Array
 
@@ -47,17 +46,15 @@ def update_player_position(state: GalaxianState, action: Action) -> GalaxianStat
 
 
 def update_enemy_positions(state: GalaxianState) -> GalaxianState:
-    if state.enemy_grid[0, state.enemy_grid.shape[1]] > SCREEN_WIDTH:
+    if state.enemy_grid_x[0, state.enemy_grid_x.shape[1]] > SCREEN_WIDTH:
         new_enemy_grid_direction = -1
-    elif state.enemy_grid[0, 0] < 0:
+    elif state.enemy_grid_x[0, 0] < 0:
         new_enemy_grid_direction = 1
     else:
         new_enemy_grid_direction = state.enemy_grid_direction
 
-    new_enemy_grid = state.enemy_grid + ENEMY_MOVE_SPEED * state.enemy_grid_direction
-    #print (new_enemy_grid)
-    #print (new_enemy_grid_direction)
-    return state._replace(enemy_grid=new_enemy_grid, enemy_grid_direction=new_enemy_grid_direction)
+    new_enemy_grid = state.enemy_grid_x + ENEMY_MOVE_SPEED * state.enemy_grid_direction
+    return state._replace(enemy_grid_x=new_enemy_grid, enemy_grid_direction=new_enemy_grid_direction)
 
 
 def init_state():
@@ -67,7 +64,12 @@ def init_state():
     start_x = START_X
 
     x_positions = jnp.arange(grid_cols) * enemy_spacing_x + start_x #arange schreibt so 0 1 2 3....
-    enemy_grid = jnp.tile(x_positions, (grid_rows, 1))    #kopiert die zeile untereinander
+    enemy_grid_x = jnp.tile(x_positions, (grid_rows, 1))    #kopiert die zeile untereinander
+
+    row_indices = jnp.arange(grid_rows).reshape(-1, 1) #erzeugt 1. enemy jeder zeile
+    enemy_y_rows = ENEMY_GRID_Y - row_indices * ENEMY_SPACING_Y #jeweils y pos
+    enemy_grid_y = jnp.broadcast_to(enemy_y_rows, (grid_rows, grid_cols))  #kopiert die werte für 1. enemy auf die rechts in der zeile
+
     enemy_alive = jnp.ones((grid_rows, grid_cols), dtype=bool) #alles auf 1
 
     return GalaxianState(player_x=jnp.array(SCREEN_WIDTH / 2),
@@ -76,7 +78,8 @@ def init_state():
                          player_shooting=jnp.array(0),
                          bullet_x=jnp.array([]),
                          bullet_y=jnp.array([]),
-                         enemy_grid=enemy_grid,
+                         enemy_grid_x=enemy_grid_x,
+                         enemy_grid_y=enemy_grid_y,
                          enemy_grid_alive=enemy_alive,
                          enemy_grid_direction=jnp.array(1))
 
@@ -131,15 +134,65 @@ def removeBullets(state: GalaxianState) -> GalaxianState:
     return state._replace(bullet_y=new_bullet_y, bullet_x=new_bullet_x)
 
 def bulletCollision(state: GalaxianState) -> GalaxianState:
-    for i in range(state.bullet_x.shape[0]):
-        for j in range(state.enemy_grid.shape[0]):
-            for k in range(state.enemy_grid.shape[1]):
-                if abs(state.bullet_x[i] - state.enemy_grid[j, k]) <= 10 and abs(state.bullet_y[i] - (ENEMY_GRID_Y - j * ENEMY_SPACING_Y)) <= 10 and state.enemy_grid_alive[j, k]:
-                    new_enemy_grid_alive = state.enemy_grid_alive.at[j, k].set(False)
-                    new_bullet_x = jnp.delete(state.bullet_x, i)
-                    new_bullet_y = jnp.delete(state.bullet_y, i)
-                    return state._replace(enemy_grid_alive=new_enemy_grid_alive, bullet_x=new_bullet_x, bullet_y=new_bullet_y)
-    return state
+    num_bullets = state.bullet_x.shape[0]
+    num_rows, num_cols = state.enemy_grid_x.shape
+
+    if num_bullets == 0:
+        return state
+
+
+    # prepare for dx and dy
+    # bullet (B,) -> (B, 1, 1)
+    # enemy_grid_x: (R, C) -> (1, R, C)
+    # enemy_grid_y: (R, C) -> (1, R, C)
+    bullet_x_exp = state.bullet_x[:, None, None]
+    bullet_y_exp = state.bullet_y[:, None, None]
+    enemy_x_exp = state.enemy_grid_x[None, :, :]
+    enemy_y_exp = state.enemy_grid_y[None, :, :]
+    print("bullet y exp ", bullet_y_exp)
+    print("bullet y true ", state.bullet_y)
+    #print("enemy y exp ", enemy_y_exp)
+    #print ("grid y shape ", state.enemy_grid_y)
+
+    # broadcasts automtically, one enemy grid per bullter
+    dx = jnp.abs(bullet_x_exp - enemy_x_exp)
+    dy = jnp.abs(bullet_y_exp - enemy_y_exp)
+
+    coll_x = dx <= COLLISION_THRESHOLD
+    coll_y = dy <= COLLISION_THRESHOLD
+
+    # one alive mask per bullet
+    alive_exp = state.enemy_grid_alive[None, :, :]
+
+    # one collision mask per bullet
+    collision_matrix = coll_x & coll_y & alive_exp
+
+    # goes through each collision mask per bullet, if one says hit for the corresponding enemy, that hit mask position is true
+    # reduced the dimension of the collision matrix to (R, C) (no more bullets)
+    enemy_hit_mask = jnp.any(collision_matrix, axis=0)
+    #denemy_hit_mask = jnp.flipud(enemy_hit_mask)
+
+    # looks at each bullets collision mask, reduces the dimension to (B) (no more enemies)
+    bullet_hit_mask = jnp.any(collision_matrix, axis=(1, 2))
+
+    hit_indices = jnp.where(enemy_hit_mask)
+    hit_coords = jnp.stack([state.enemy_grid_x[hit_indices], state.enemy_grid_y[hit_indices]], axis=-1)
+    jax.debug.print("Hit at coordinates: {}", hit_coords)
+    #print(state.enemy_grid_y)
+
+    # if enemy_hit_mask is true, jnp.where sets that position to x (false), else to its third argument (old value)
+    new_enemy_grid_alive = jnp.where(enemy_hit_mask, False, state.enemy_grid_alive)
+    #print("enemy alive  ", new_enemy_grid_alive)
+
+    # filter bullets that hit enemies
+    new_bullet_x = state.bullet_x[~bullet_hit_mask]
+    new_bullet_y = state.bullet_y[~bullet_hit_mask]
+
+    return state._replace(
+        enemy_grid_alive=new_enemy_grid_alive,
+        bullet_x=new_bullet_x,
+        bullet_y=new_bullet_y
+    )
 
 def draw(screen, state: GalaxianState):
     player_rect = pygame.Rect(int(state.player_x), int(600 - state.player_y), 20, 10)
@@ -150,11 +203,12 @@ def draw(screen, state: GalaxianState):
             bullet_rect = pygame.Rect(int(state.bullet_x[i]), int(600 - state.bullet_y[i]), 5, 10)
             pygame.draw.rect(screen, (255, 255, 0), bullet_rect)
 
-    for i in range(state.enemy_grid.shape[0]):
-        for j in range(state.enemy_grid.shape[1]):
+    for i in range(state.enemy_grid_x.shape[0]):
+        for j in range(state.enemy_grid_x.shape[1]):
             if state.enemy_grid_alive[i, j]:
-                x = int(state.enemy_grid[i, j])
-                y = ENEMY_GRID_Y + i * ENEMY_SPACING_Y
+                x = int(state.enemy_grid_x[i, j])
+                y = int(state.enemy_grid_y[i, j])
+                print("drawing y: ", y)
                 enemy_rect = pygame.Rect(x, y, 15, 10)
                 pygame.draw.rect(screen, (255, 0, 0), enemy_rect)
 
@@ -166,6 +220,8 @@ def step(state: GalaxianState, action: Action) -> GalaxianState:
     newState = updateBullets(newState)
     newState = removeBullets(newState)
     newState = bulletCollision(newState)
+    #print("Enemy X :", state.enemy_grid_x)
+    #print("Enemy Y :", state.enemy_grid_y)
     return  newState
 
 
