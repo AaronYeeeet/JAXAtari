@@ -100,6 +100,9 @@ class GalaxianState(NamedTuple):
     enemy_attack_bullet_y: chex.Array
     enemy_attack_bullet_timer: chex.Array
     enemy_attack_pause_step: chex.Array
+    enemy_attack_death_frame: chex.Array
+    enemy_attack_death_x: chex.Array
+    enemy_attack_death_y: chex.Array
     lives: chex.Array
     player_alive: chex.Array
     player_respawn_timer: chex.Array
@@ -624,6 +627,36 @@ def update_death_frames(state: GalaxianState) -> GalaxianState:
     )
 
 @jax.jit
+def update_diver_death_frames(state: GalaxianState) -> GalaxianState:
+    # Advance each diver’s death frame 1→2→…→5→0,
+    # and when it wraps (i.e. frame was 5) clear its x/y back to -1.
+    def advance_and_clear(frame, coord):
+        # next frame counter
+        next_frame = jnp.where(frame == 0, 0,
+                        jnp.where(frame < 5, frame + 1, 0))
+        # clear coords when wrapping from 5→0
+        new_coord = jnp.where(frame == 5,
+                              jnp.full_like(coord, -1.0),
+                              coord)
+        return next_frame, new_coord
+
+    # pull out per-diver data
+    frames = state.enemy_attack_death_frame              # (D,)
+    coords = jnp.stack([state.enemy_attack_death_x,
+                        state.enemy_attack_death_y],      # (D,2)
+                       axis=1)
+
+    # vectorize
+    next_frames, next_coords = jax.vmap(advance_and_clear)(frames, coords)
+
+    return state._replace(
+        enemy_attack_death_frame = next_frames,
+        enemy_attack_death_x     = next_coords[:, 0],
+        enemy_attack_death_y     = next_coords[:, 1],
+    )
+
+
+@jax.jit
 def bullet_collision_attack(state: GalaxianState) -> GalaxianState:
     # Abstände
     x_diff = jnp.abs(state.bullet_x - state.enemy_attack_x)
@@ -632,19 +665,32 @@ def bullet_collision_attack(state: GalaxianState) -> GalaxianState:
     mask = (x_diff <= 10) & (y_diff <= 10) & (state.enemy_attack_states == 1)
     hit = jnp.any(mask)
 
+
     def process_hit(state: GalaxianState) -> GalaxianState:
         hit_indices = jnp.where(mask, size=MAX_DIVERS, fill_value=-1)[0]
         hit_idx = hit_indices[0]
+        enemy_pos = state.enemy_attack_pos[hit_idx]
+        new_death = state.enemy_death_frame.at[enemy_pos[0],enemy_pos[1]].set(1)
         pos = state.enemy_attack_pos[hit_idx]
-        new_grid = state.enemy_grid_alive.at[tuple(pos)].set(0)
-
+        new_grid = state.enemy_grid_alive.at[pos[0], pos[1]].set(2)
         new_attack_states = state.enemy_attack_states.at[hit_idx].set(0)
+        new_death_frame = state.enemy_attack_death_frame.at[hit_idx].set(1)
+        hit_idx = jnp.where(mask, size=MAX_DIVERS, fill_value=-1)[0][0]
+        hx = state.enemy_attack_x[hit_idx]
+        hy = state.enemy_attack_y[hit_idx]
+
+        new_death_x = state.enemy_attack_death_x.at[hit_idx].set(hx)
+        new_death_y = state.enemy_attack_death_y.at[hit_idx].set(hy)
 
         return state._replace(
+            enemy_death_frame = new_death,
             enemy_grid_alive=new_grid,
             bullet_x=jnp.array(-1.0, dtype=state.bullet_x.dtype),
             bullet_y=jnp.array(-1.0, dtype=state.bullet_y.dtype),
             enemy_attack_states=new_attack_states,
+            enemy_attack_death_frame = new_death_frame,
+            enemy_attack_death_x = new_death_x,
+            enemy_attack_death_y= new_death_y,
             score=state.score + jnp.array(50, dtype=state.score.dtype)
         )
 
@@ -791,6 +837,9 @@ class JaxGalaxian(JaxEnvironment[GalaxianState, GalaxianObservation, GalaxianInf
                               enemy_attack_bullet_y=jnp.full(MAX_DIVERS, -1.0),
                               enemy_attack_bullet_timer=jnp.zeros(MAX_DIVERS),
                               enemy_attack_pause_step=jnp.array(0),
+                              enemy_attack_death_frame=jnp.zeros((MAX_DIVERS,), dtype=jnp.int32),
+                            enemy_attack_death_x = jnp.full((MAX_DIVERS,), -1.0),
+                            enemy_attack_death_y = jnp.full((MAX_DIVERS,), -1.0),
                               lives=jnp.array(3),
                               player_alive=jnp.array(True),
                               player_respawn_timer=jnp.array(PLAYER_DEATH_DELAY),
@@ -854,6 +903,9 @@ class JaxGalaxian(JaxEnvironment[GalaxianState, GalaxianObservation, GalaxianInf
         new_state = update_enemy_bullets(new_state)
         new_state = check_player_death_by_enemy(new_state)
         new_state = check_player_death_by_bullet(new_state)
+        new_state = bullet_collision_attack(new_state)
+        new_state = update_diver_death_frames(new_state)
+        new_state = update_death_frames(new_state)
         new_state = new_state._replace(turn_step=new_state.turn_step + 1)
 
         new_state = jax.lax.cond(jnp.logical_and(jnp.logical_not(jnp.any(state.enemy_grid_alive == 1)), jnp.logical_not(jnp.any(state.enemy_attack_states != 0))), lambda new_state: enter_new_wave(new_state), lambda s: s, new_state)
@@ -1085,6 +1137,20 @@ class GalaxianRenderer(AtraJaxisRenderer):
             return lax.fori_loop(0, GRID_COLS, col_body, r_acc)
 
         raster = lax.fori_loop(0, GRID_ROWS, row_body, raster)
+
+        # draw dive-death animations at hit locations
+        def draw_diver_death(i, r_acc):
+            df = state.enemy_attack_death_frame[i]
+
+            def yes(r):
+                spr = get_sprite_frame(self.SPRITE_ENEMY_DEATH, df - 1)
+                x = jnp.round(state.enemy_attack_death_x[i]).astype(jnp.int32)
+                y = jnp.round(state.enemy_attack_death_y[i]).astype(jnp.int32)
+                return render_at(r, x, y, spr)
+
+            return lax.cond(df > 0, yes, lambda r: r, r_acc)
+
+        raster = lax.fori_loop(0, MAX_DIVERS, draw_diver_death, raster)
 
         # Lebens-Icons unten rechts
         life_sprite = aj.get_sprite_frame(self.SPRITE_LIFE, 0)
