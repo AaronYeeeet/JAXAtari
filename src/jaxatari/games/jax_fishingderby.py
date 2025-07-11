@@ -1,6 +1,6 @@
 import os
 from functools import partial
-from typing import NamedTuple, Tuple, List, Dict
+from typing import NamedTuple, Tuple, List, Dict, Any, Optional
 
 import aj
 import jax
@@ -378,107 +378,57 @@ def load_sprites():
     )
 
 class FishingDerbyRenderer(AtraJaxisRenderer):
+    sprites: Dict[str, Any]
+
     def __init__(self):
-        self.config = GameConfig()
-        (
-            self.SPRITE_BG, self.SPRITE_PLAYER1, self.SPRITE_PLAYER2,
-            self.SPRITE_SHARK1, self.SPRITE_SHARK2, self.SPRITE_FISH1,
-            self.SPRITE_FISH2, self.SPRITE_SKY, self.SPRITE_SCORE_DIGITS
-        ) = load_sprites()
 
-    @partial(jax.jit, static_argnums=(0,))
-    def render(self, state: GameState) -> chex.Array:
-        cfg = self.config
-        raster = jnp.zeros((cfg.SCREEN_HEIGHT, cfg.SCREEN_WIDTH, 3), dtype=jnp.uint8)
+        self.sprite_path = f"{os.path.dirname(os.path.abspath(__file__))}/sprites/fishingderby"
+        self.sprites = self._load_sprites()
 
-        # Draw sky
-        raster = raster.at[:cfg.WATER_Y_START, :, :].set(jnp.array(cfg.SKY_COLOR, dtype=jnp.uint8))
-        # Draw water
-        raster = raster.at[cfg.WATER_Y_START:, :, :].set(jnp.array(cfg.WATER_COLOR, dtype=jnp.uint8))
+        self.background = self.sprites.get('background')
 
-        # Draw players
-        raster = self._render_at(raster, cfg.P1_START_X, cfg.PLAYER_Y, self.SPRITE_PLAYER1)
-        raster = self._render_at(raster, cfg.P2_START_X, cfg.PLAYER_Y, self.SPRITE_PLAYER2)
+    def _load_sprites(self):
+        sprites: Dict[str, Any] = {}
 
-        # Draw fishing lines
-        raster = self._render_line(raster, cfg.P1_START_X + 10, cfg.PLAYER_Y + 10, state.p1.hook_x, state.p1.hook_y)
-        raster = self._render_line(raster, cfg.P2_START_X + 2, cfg.PLAYER_Y + 10, state.p2.hook_x, state.p2.hook_y)
+        # Helper function to load a single sprite frame
 
-        # Draw shark
-        shark_frame = jax.lax.cond((state.time // 8) % 2 == 0, lambda: self.SPRITE_SHARK1, lambda: self.SPRITE_SHARK2)
-        raster = self._render_at(raster, state.shark_x, cfg.SHARK_Y, shark_frame, flip_h=state.shark_dir < 0)
+        def _load_sprite_frame(name: str) -> Optional[chex.Array]:
+            path = os.path.join(self.sprite_path, f'{name}.npy')
+            frame = aj.loadFrame(path)
+            if isinstance(frame, jnp.ndarray) and frame.ndim >= 2:
+                return frame.astype(jnp.uint8)
 
-        # Draw fish
-        fish_frame = jax.lax.cond((state.time // 10) % 2 == 0, lambda: self.SPRITE_FISH1, lambda: self.SPRITE_FISH2)
+        sprite_names = [
+            'background', 'sky', 'player1', 'player2', 'shark1', 'shark2',
+            'fish1', 'fish2',
+        ]
+        for name in sprite_names:
+            loaded_sprite = _load_sprite_frame(name)
+            if loaded_sprite is not None:
+                sprites[name] = loaded_sprite
 
-        def draw_one_fish(i, r):
-            pos, direction, active = state.fish_positions[i], state.fish_directions[i], state.fish_active[i]
-            return jax.lax.cond(active,
-                                lambda r_in: self._render_at(r_in, pos[0], pos[1], fish_frame, flip_h=direction < 0),
-                                lambda r_in: r_in, r)
+        # pad sprites
+        shark_sprites = aj.pad_to_match([sprites['shark1'], sprites['shark2']])
+        sprites['shark1'] = shark_sprites[0]
+        sprites['shark2'] = shark_sprites[1]
 
-        raster = jax.lax.fori_loop(0, cfg.NUM_FISH, draw_one_fish, raster)
+        fish_sprites = aj.pad_to_match([sprites['fish1'], sprites['fish2']])
+        sprites['fish1'] = fish_sprites[0]
+        sprites['fish2'] = fish_sprites[1]
 
-        # Draw hooked fish
-        def draw_hooked(p_state, r):
-            return jax.lax.cond(p_state.hook_state > 0,
-                                lambda r_in: self._render_at(r_in, p_state.hook_x, p_state.hook_y, fish_frame),
-                                lambda r_in: r_in, r)
+        # load digit sprites
+        score_digit_path = os.path.join(self.sprite_path, 'score_{}.npy')
+        digits = aj.loadFrame(score_digit_path, num_chars = 10)
+        sprites['digits'] = digits
 
-        raster = draw_hooked(state.p1, raster)
-        raster = draw_hooked(state.p2, raster)
+        # expand all sprites similar to the Pong/Seaquest loading
+        for key in sprites.keys():
+            if isinstance(sprites[key], (list, tuple)):
+                sprites[key] = [jnp.expand_dims(sprite, axis=0) for sprite in sprites[key]]
+            else:
+                sprites[key] = jnp.expand_dims(sprites[key], axis=0)
 
-        # Draw scores
-        raster = self._render_score(raster, state.p1.score, 50, 20)
-        raster = self._render_score(raster, state.p2.score, 100, 20)
-
-        return raster
-
-    def _render_score(self, raster, score, x, y):
-        s1, s0 = score // 10, score % 10
-        digit1_sprite, digit0_sprite = self.SPRITE_SCORE_DIGITS[s1], self.SPRITE_SCORE_DIGITS[s0]
-        raster = self._render_at(raster, x, y, digit1_sprite)
-        raster = self._render_at(raster, x + 7, y, digit0_sprite)
-        return raster
-
-    @staticmethod
-    @jax.jit
-    def _render_at(raster, x, y, sprite, flip_h=False):
-        sprite_rgb = sprite[:, :, :3]
-        x, y = jnp.round(x).astype(jnp.int32), jnp.round(y).astype(jnp.int32)
-        sprite_to_draw = jnp.where(flip_h, jnp.fliplr(sprite_rgb), sprite_rgb)
-        return jax.lax.dynamic_update_slice(raster, sprite_to_draw, (y, x, 0))
-
-    @staticmethod
-    @jax.jit
-    def _render_line(raster, x0, y0, x1, y1, color=(200, 200, 200)):
-        x0, y0, x1, y1 = jnp.round(jnp.array([x0, y0, x1, y1])).astype(jnp.int32)
-        dx, sx, dy, sy = jnp.abs(x1 - x0), jnp.sign(x1 - x0), -jnp.abs(y1 - y0), jnp.sign(y1 - y0)
-        err = dx + dy
-        color_uint8 = jnp.array(color, dtype=jnp.uint8)
-
-        def loop_body(carry):
-            x, y, r, e = carry
-            safe_y, safe_x = jnp.clip(y, 0, r.shape[0] - 1), jnp.clip(x, 0, r.shape[1] - 1)
-            r = r.at[safe_y, safe_x, :].set(color_uint8)
-            e2 = 2 * e
-            e_new = jnp.where(e2 >= dy, e + dy, e)
-            x_new = jnp.where(e2 >= dy, x + sx, x)
-            e_final = jnp.where(e2 <= dx, e_new + dx, e_new)
-            y_new = jnp.where(e2 <= dx, y + sy, y)
-            return x_new, y_new, r, e_final
-
-        def loop_cond(carry):
-            return ~((carry[0] == x1) & (carry[1] == y1))
-
-        _, _, raster, _ = jax.lax.while_loop(loop_cond, loop_body, (x0, y0, raster, err))
-        return raster
-
-        def loop_cond(carry):
-            return ~((carry[0] == x1) & (carry[1] == y1))
-
-        _, _, raster, _ = jax.lax.while_loop(loop_cond, loop_body, (x0, y0, raster, err))
-        return raster
+        return sprites
 
 def get_human_action() -> chex.Array:
     keys = pygame.key.get_pressed()
