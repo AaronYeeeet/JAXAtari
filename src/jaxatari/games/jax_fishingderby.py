@@ -1252,3 +1252,4 @@ if __name__ == "__main__":
     pygame.quit()
 
     # run with: python scripts/play.py --game fishingderby --record my_record_file.npz
+    # blank
